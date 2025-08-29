@@ -1,13 +1,14 @@
 {
-  "name": "taixiu-nodejs",
+  "name": "sunwin-taixiu-pro",
   "version": "1.0.0",
-  "description": "Flask VIP Tài/Xỉu - Node.js version",
-  "main": "server.js",
+  "description": "API dự đoán Tài Xỉu",
+  "main": "app.js",
+  "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node app.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^2.7.0"
   }
 }
