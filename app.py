@@ -15,55 +15,63 @@ import requests
 import time
 import math
 import threading
+import os
+import logging
 from collections import Counter, deque, defaultdict
 from flask import Flask, jsonify
+from waitress import serve  # Sử dụng waitress thay vì server phát triển của Flask
 
 # =========================
-# Cấu hình
+# Cấu hình logging
 # =========================
-# Địa chỉ API để lấy dữ liệu. Lưu ý, Render có thể tắt API nếu không có request
-# Thường xuyên.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# =========================
+# Cấu hình ứng dụng
+# =========================
 POLL_URL = "https://toilavinhmaycays23.onrender.com/vinhmaycay"
-POLL_INTERVAL_SEC = 30  # Chu kỳ poll
+POLL_INTERVAL_SEC = 30
 MAX_HISTORY = 500  # Lưu tối đa 500 phiên gần nhất
 
-# Trọng số tổ hợp (có thể tinh chỉnh)
+# Trọng số tổ hợp
 W_MARKOV = 0.46
 W_PATTERN = 0.28
 W_LOCAL_TREND = 0.14
 W_GLOBAL_FREQ = 0.12
 
-# Giới hạn độ tin cậy hiển thị (chống overfit)
+# Giới hạn độ tin cậy
 CONF_MIN = 52.0
 CONF_MAX = 97.5
 
 app = Flask(__name__)
 
 # =========================
-# Bộ nhớ dùng chung giữa các luồng
+# Bộ nhớ
 # =========================
-# Sử dụng deque để quản lý lịch sử hiệu quả hơn
-history = deque(maxlen=MAX_HISTORY)   # list dict: {'phien': int, 'ket_qua': 'Tài'|'Xỉu'}
+history = deque(maxlen=MAX_HISTORY)  # list dict: {'phien': int, 'ket_qua': 'Tài'|'Xỉu'}
 last_phien = None
-# Khóa để đồng bộ truy cập vào các biến dùng chung
 lock = threading.Lock()
 
 # Markov store: dict[k][pattern_str]['Tài'|'Xỉu'] = count
 markov_counts = {k: defaultdict(lambda: {'Tài': 0, 'Xỉu': 0}) for k in range(1, 11)}
 
 # =========================
-# Các hàm tiện ích
+# Utils
 # =========================
 def as_TX(result_str):
-    """Chuyển 'Tài'/'Xỉu' thành 'T'/'X'."""
     return 'T' if result_str == 'Tài' else 'X'
 
 def from_TX(ch):
-    """Chuyển 'T'/'X' thành 'Tài'/'Xỉu'."""
     return 'Tài' if ch == 'T' else 'Xỉu'
 
 def current_streak(results):
-    """Trả về (độ dài chuỗi bệt hiện tại, 'Tài'/'Xỉu' hoặc None)."""
     if not results:
         return 0, None
     side = results[-1]
@@ -75,17 +83,20 @@ def current_streak(results):
             break
     return streak, side
 
+def entropy(p):
+    if p <= 0.0 or p >= 1.0:
+        return 0.0
+    return - (p * math.log(p, 2) + (1 - p) * math.log(1 - p, 2))
+
 # =========================
 # Cập nhật Markov
 # =========================
-def rebuild_markov():
-    """Xây lại thống kê Markov n-gram từ đầu."""
+def rebuild_markov(results):
     for k in range(1, 11):
         markov_counts[k].clear()
-    if len(history) < 2:
+    if len(results) < 2:
         return
-    
-    tx = [as_TX(h['ket_qua']) for h in history]
+    tx = [as_TX(r) for r in results]
     for k in range(1, 11):
         if len(tx) <= k:
             continue
@@ -95,12 +106,10 @@ def rebuild_markov():
             out = from_TX(nxt)
             markov_counts[k][pattern][out] += 1
 
-def update_markov_with_new():
-    """Cập nhật Markov incremental khi có kết quả mới."""
-    if len(history) < 2:
+def update_markov_with_new(results):
+    if len(results) < 2:
         return
-    
-    tx = [as_TX(h['ket_qua']) for h in history]
+    tx = [as_TX(r) for r in results]
     for k in range(1, 11):
         if len(tx) > k:
             pattern = ''.join(tx[-(k+1):-1])
@@ -109,53 +118,58 @@ def update_markov_with_new():
             markov_counts[k][pattern][out] += 1
 
 # =========================
-# Phân tích cầu (pattern analysis)
+# Phân tích cầu
 # =========================
 def smart_pattern_analysis(results):
-    """
-    Phát hiện & chấm điểm cầu.
-    Trả về: (bridge_labels, pattern_vote)
-    """
     labels = []
     vote = {'Tài': 0.0, 'Xỉu': 0.0}
     n = len(results)
-    if n < 3:
-        return ["Không đủ dữ liệu"], vote
+    if n == 0:
+        return labels, vote
 
-    # Cầu bệt
     streak, side = current_streak(results)
     if streak >= 3:
         labels.append(f"Cầu bệt {side} ({streak})")
         s = min(12.0 + (streak-3)*2.5, 28.0)
         vote[side] += s
 
-    # Các cầu khác (1-1, 2-2, v.v.)
-    def check_pattern(name, pattern, score, next_predict_side):
-        if tuple(results[-len(pattern):]) == pattern:
-            labels.append(f"Cầu {name}")
-            vote[next_predict_side] += score
-    
-    check_pattern("1-1", ('Tài', 'Xỉu', 'Tài', 'Xỉu'), 18.0, 'Tài')
-    check_pattern("1-1", ('Xỉu', 'Tài', 'Xỉu', 'Tài'), 18.0, 'Xỉu')
-    check_pattern("2-2", ('Tài', 'Tài', 'Xỉu', 'Xỉu'), 12.0, 'Tài')
-    check_pattern("2-2", ('Xỉu', 'Xỉu', 'Tài', 'Tài'), 12.0, 'Xỉu')
-    check_pattern("2-1", ('Tài', 'Tài', 'Xỉu'), 10.0, 'Tài')
-    check_pattern("2-1", ('Xỉu', 'Xỉu', 'Tài'), 10.0, 'Xỉu')
-    check_pattern("2-3", ('Tài', 'Tài', 'Xỉu', 'Xỉu', 'Xỉu'), 14.0, 'Tài')
-    check_pattern("2-3", ('Xỉu', 'Xỉu', 'Tài', 'Tài', 'Tài'), 14.0, 'Xỉu')
-    
+    if n >= 4:
+        last4 = results[-4:]
+        if last4 in (['Tài','Xỉu','Tài','Xỉu'], ['Xỉu','Tài','Xỉu','Tài']):
+            labels.append("Cầu 1-1")
+            next_side = 'Tài' if results[-1] == 'Xỉu' else 'Xỉu'
+            vote[next_side] += 18.0
+
+    if n >= 4:
+        last4 = results[-4:]
+        if last4 in (['Tài','Tài','Xỉu','Xỉu'], ['Xỉu','Xỉu','Tài','Tài']):
+            labels.append("Cầu 2-2")
+            prefer = 'Tài' if last4 == ['Tài','Tài','Xỉu','Xỉu'] else 'Xỉu'
+            vote[prefer] += 12.0
+
+    if n >= 3:
+        last3 = results[-3:]
+        if last3 in (['Tài','Tài','Xỉu'], ['Xỉu','Xỉu','Tài']):
+            labels.append("Cầu 2-1")
+            prefer = 'Tài' if last3[:2] == ['Tài','Tài'] else 'Xỉu'
+            vote[prefer] += 10.0
+
+    if n >= 5:
+        last5 = results[-5:]
+        if last5 in (['Tài','Tài','Xỉu','Xỉu','Xỉu'], ['Xỉu','Xỉu','Tài','Tài','Tài']):
+            labels.append("Cầu 2-3")
+            prefer = 'Xỉu' if last5[-3:] == ['Xỉu','Xỉu','Xỉu'] else 'Tài'
+            vote[prefer] += 14.0
+
     if not labels:
         labels.append("Không có cầu rõ ràng")
 
     return labels, vote
 
 # =========================
-# Dự đoán Markov & các yếu tố khác
+# Dự đoán Markov
 # =========================
 def markov_predict(results):
-    """
-    Tổng hợp dự đoán từ các bậc Markov.
-    """
     if len(results) < 2:
         return 0.5, "Markov: thiếu dữ liệu", 0
 
@@ -172,15 +186,13 @@ def markov_predict(results):
         counts = markov_counts[k].get(prefix, None)
         if not counts:
             continue
-        
-        cT, cX = counts['Tài'], counts['Xỉu']
+        cT = counts['Tài']
+        cX = counts['Xỉu']
         total = cT + cX
         if total == 0:
             continue
-        
         pT = cT / total
         w = k * math.log(1 + total, 2)
-        
         agg_prob_t += pT * w
         agg_weight += w
         total_followers += total
@@ -193,8 +205,10 @@ def markov_predict(results):
     info = "Markov[" + ", ".join(details[:4]) + (", ..." if len(details) > 4 else "") + "]"
     return prob_t, info, total_followers
 
+# =========================
+# Xu hướng & Tần suất
+# =========================
 def local_trend(results, lookback=10):
-    """Tỉ lệ Tài trong lookback gần nhất."""
     if not results:
         return 0.5, 0
     m = min(len(results), lookback)
@@ -203,25 +217,15 @@ def local_trend(results, lookback=10):
     return cT / m, m
 
 def global_freq(results):
-    """Tỉ lệ Tài toàn cục."""
     if not results:
         return 0.5, 0
     cT = sum(1 for r in results if r == 'Tài')
     return cT / len(results), len(results)
 
-def entropy(p):
-    """Tính entropy nhị phân."""
-    if p <= 0.0 or p >= 1.0:
-        return 0.0
-    return - (p*math.log(p, 2) + (1-p)*math.log(1-p, 2))
-
 # =========================
-# Hợp nhất phiếu & tính độ tin cậy
+# Hợp nhất phiếu
 # =========================
-def combine_votes(prob_markov, pattern_vote, prob_local, prob_global, cover_markov, bridges):
-    """
-    Hợp nhất xác suất từ các mô-đun vào xác suất cuối cùng (Tài).
-    """
+def combine_votes(prob_markov, pattern_vote, prob_local, prob_global, cover_markov, n_local, n_global, bridges):
     sT = pattern_vote.get('Tài', 0.0)
     sX = pattern_vote.get('Xỉu', 0.0)
     if sT == 0.0 and sX == 0.0:
@@ -231,24 +235,23 @@ def combine_votes(prob_markov, pattern_vote, prob_local, prob_global, cover_mark
         eX = math.exp(sX / 12.0)
         prob_pattern = eT / (eT + eX)
 
-    # Điều chỉnh trọng số
-    wM = W_MARKOV * (0.5 + min(0.5, math.log(1 + cover_markov, 3) / 5.0))
-    wL = W_LOCAL_TREND * (0.5 + min(0.5, math.log(1 + len(history), 3) / 5.0))
-    wG = W_GLOBAL_FREQ * (0.5 + min(0.5, math.log(1 + len(history), 3) / 5.0))
-    
-    total_weight = wM + W_PATTERN + wL + wG
-    if total_weight == 0:
-        return 'Tài', CONF_MIN, 0.5
+    wM = 0.5 + min(0.5, math.log(1 + cover_markov, 3) / 5.0)
+    wL = 0.5 + min(0.5, math.log(1 + n_local, 3) / 5.0)
+    wG = 0.5 + min(0.5, math.log(1 + n_global, 3) / 5.0)
 
-    p = (prob_markov * wM +
-         prob_pattern * W_PATTERN +
-         prob_local * wL +
-         prob_global * wG) / total_weight
+    WM = W_MARKOV * wM
+    WP = W_PATTERN
+    WL = W_LOCAL_TREND * wL
+    WG = W_GLOBAL_FREQ * wG
 
-    # Tính độ tin cậy dựa trên entropy
-    H = entropy(p)  # 0..1
-    conf = (1.0 - H) * 100.0  # 0..100
-    
+    p = (prob_markov * WM +
+         prob_pattern * WP +
+         prob_local * WL +
+         prob_global * WG) / (WM + WP + WL + WG)
+
+    H = entropy(p)
+    conf = (1.0 - H) * 100.0
+
     clear_patterns = [b for b in bridges if b != "Không có cầu rõ ràng"]
     if clear_patterns:
         conf *= min(1.15, 1.03 + 0.03 * len(clear_patterns))
@@ -256,29 +259,25 @@ def combine_votes(prob_markov, pattern_vote, prob_local, prob_global, cover_mark
         conf *= 0.96
 
     conf = max(CONF_MIN, min(CONF_MAX, conf))
-
     predict = 'Tài' if p >= 0.5 else 'Xỉu'
     return predict, conf, prob_pattern
 
 # =========================
-# Hàm dự đoán chính
+# Dự đoán chính
 # =========================
 def predict_vip(results):
-    """
-    Dự đoán Tài/Xỉu dựa trên nhiều yếu tố.
-    """
     n = len(results)
     if n == 0:
         return 'Tài', 50.0, "Chưa có dữ liệu."
 
     bridges, pattern_vote = smart_pattern_analysis(results)
     prob_markov, markov_info, cover = markov_predict(results)
-    prob_local10, _ = local_trend(results, lookback=10)
-    prob_global, _ = global_freq(results)
+    prob_local10, n_local = local_trend(results, lookback=10)
+    prob_global, n_global = global_freq(results)
 
     predict, conf, prob_pattern = combine_votes(
         prob_markov, pattern_vote, prob_local10, prob_global,
-        cover, bridges
+        cover, n_local, n_global, bridges
     )
 
     brief_pattern = ", ".join(bridges)
@@ -304,40 +303,41 @@ def poll_api():
     global last_phien
     while True:
         try:
-            resp = requests.get(POLL_URL, timeout=15)
+            resp = requests.get(POLL_URL, timeout=10)
+            resp.raise_for_status()
             data = resp.json()
+
             phien = data.get('Phien')
             ket_qua = data.get('Ket_qua')
 
             if phien is None or ket_qua not in ('Tài', 'Xỉu'):
-                print("[poll_api] Invalid data received.")
+                logger.warning(f"Invalid data: Phien={phien}, Ket_qua={ket_qua}")
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
             with lock:
                 global history
+                global markov_counts
                 if last_phien is None:
-                    # Lần chạy đầu tiên hoặc reset
                     history.append({'phien': phien, 'ket_qua': ket_qua})
                     last_phien = phien
-                    rebuild_markov()
+                    rebuild_markov([h['ket_qua'] for h in history])
+                    logger.info(f"Initialized with phien {phien}")
                 else:
                     if phien > last_phien:
-                        # Thêm kết quả mới nếu có phiên mới
                         history.append({'phien': phien, 'ket_qua': ket_qua})
                         last_phien = phien
-                        update_markov_with_new()
+                        update_markov_with_new([h['ket_qua'] for h in history])
+                        logger.info(f"Updated with new phien {phien}: {ket_qua}")
 
-        except requests.exceptions.Timeout:
-            print("[poll_api] Request timed out.")
-        except requests.exceptions.RequestException as e:
-            print(f"[poll_api] Request error: {e}")
+        except requests.RequestException as e:
+            logger.error(f"Poll API error: {e}")
         except Exception as e:
-            print(f"[poll_api] Unexpected error: {e}")
-            
+            logger.error(f"Unexpected error in poll_api: {e}")
+
         time.sleep(POLL_INTERVAL_SEC)
 
-# Khởi động polling thread (daemon)
+# Khởi động polling thread
 threading.Thread(target=poll_api, daemon=True).start()
 
 # =========================
@@ -347,23 +347,24 @@ threading.Thread(target=poll_api, daemon=True).start()
 def get_predict():
     with lock:
         if not history:
+            logger.warning("Predict called but no data available")
             return jsonify({'error': 'No data available yet. Waiting for API poll.'}), 503
 
         results = [h['ket_qua'] for h in history]
         pred, confidence, explain = predict_vip(results)
 
-        session_data = {}
         try:
             resp = requests.get(POLL_URL, timeout=8)
-            session_data = resp.json()
-        except Exception:
-            # Fallback to local history if API fails
-            pass
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"Error fetching latest data: {e}")
+            data = {}
 
-        session = session_data.get('Phien', history[-1]['phien'])
-        dice = f"{session_data.get('Xuc_xac_1', '')} - {session_data.get('Xuc_xac_2', '')} - {session_data.get('Xuc_xac_3', '')}"
-        total = session_data.get('Tong', '')
-        result = session_data.get('Ket_qua', history[-1]['ket_qua'])
+        session = data.get('Phien', history[-1]['phien'] if history else None)
+        dice = f"{data.get('Xuc_xac_1', '')} - {data.get('Xuc_xac_2', '')} - {data.get('Xuc_xac_3', '')}"
+        total = data.get('Tong', '')
+        result = data.get('Ket_qua', history[-1]['ket_qua'] if history else '')
         next_session = session + 1 if isinstance(session, int) else None
         pattern_str = ''.join(['T' if r == 'Tài' else 'X' for r in results[-20:]])
 
@@ -402,10 +403,12 @@ def get_stats():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'ok': True, 'history_size': len(history), 'last_phien': last_phien})
+    return jsonify({'ok': True})
 
 # =========================
-# Chạy app
+# Chạy ứng dụng
 # =========================
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))  # Lấy port từ biến môi trường
+    logger.info(f"Starting server on port {port}")
+    serve(app, host='0.0.0.0', port=port, threads=4)  # Sử dụng waitress
