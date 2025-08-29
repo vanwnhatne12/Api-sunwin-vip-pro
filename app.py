@@ -409,6 +409,6 @@ def health():
 # Chạy ứng dụng
 # =========================
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))  # Lấy port từ biến môi trường
+    port = int(os.environ.get('PORT', 5000))
     logger.info(f"Starting server on port {port}")
-    serve(app, host='0.0.0.0', port=port, threads=4)  # Sử dụng waitress
+    app.run(host='0.0.0.0', port=port)
